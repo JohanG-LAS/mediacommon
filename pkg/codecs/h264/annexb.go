@@ -37,7 +37,8 @@ func (a *AnnexB) Unmarshal(buf []byte) error {
 		end   int
 	}
 
-	positions := make([]naluPos, 0, 8)
+	var posArr [MaxNALUsPerAccessUnit]naluPos
+	posCount := 0
 	auSize := 0
 
 	for pos < len(buf) {
@@ -49,7 +50,12 @@ func (a *AnnexB) Unmarshal(buf []byte) error {
 				if (auSize + remaining) > MaxAccessUnitSize {
 					return fmt.Errorf("access unit size (%d) is too big, maximum is %d", auSize+remaining, MaxAccessUnitSize)
 				}
-				positions = append(positions, naluPos{start: pos, end: len(buf)})
+				if posCount >= MaxNALUsPerAccessUnit {
+					return fmt.Errorf("NALU count (%d) exceeds maximum allowed (%d)",
+						posCount+1, MaxNALUsPerAccessUnit)
+				}
+				posArr[posCount] = naluPos{start: pos, end: len(buf)}
+				posCount++
 			}
 			break
 		}
@@ -67,24 +73,24 @@ func (a *AnnexB) Unmarshal(buf []byte) error {
 			if auSize > MaxAccessUnitSize {
 				return fmt.Errorf("access unit size (%d) is too big, maximum is %d", auSize, MaxAccessUnitSize)
 			}
-			positions = append(positions, naluPos{start: pos, end: naluEnd})
+			if posCount >= MaxNALUsPerAccessUnit {
+				return fmt.Errorf("NALU count (%d) exceeds maximum allowed (%d)",
+					posCount+1, MaxNALUsPerAccessUnit)
+			}
+			posArr[posCount] = naluPos{start: pos, end: naluEnd}
+			posCount++
 		}
 
 		pos += i + 3
 	}
 
-	if len(positions) == 0 {
+	if posCount == 0 {
 		return ErrAnnexBNoNALUs
 	}
 
-	if len(positions) > MaxNALUsPerAccessUnit {
-		return fmt.Errorf("NALU count (%d) exceeds maximum allowed (%d)",
-			len(positions), MaxNALUsPerAccessUnit)
-	}
-
-	*a = make([][]byte, len(positions))
-	for i := range positions {
-		(*a)[i] = buf[positions[i].start:positions[i].end]
+	*a = make([][]byte, posCount)
+	for i := range posCount {
+		(*a)[i] = buf[posArr[i].start:posArr[i].end]
 	}
 
 	return nil
