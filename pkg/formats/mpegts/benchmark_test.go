@@ -1,7 +1,9 @@
 package mpegts
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
 
@@ -10,6 +12,22 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/codecs"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/substructs"
 )
+
+type writeCounter struct {
+	calls int
+	bytes int
+}
+
+func (wc *writeCounter) Write(p []byte) (int, error) {
+	wc.calls++
+	wc.bytes += len(p)
+	return len(p), nil
+}
+
+func (wc *writeCounter) reset() {
+	wc.calls = 0
+	wc.bytes = 0
+}
 
 const benchFrameCount = 100
 
@@ -206,4 +224,125 @@ func BenchmarkWriter(b *testing.B) {
 			_ = w.WriteMPEG1Audio(track, pts, frames)
 		}
 	})
+}
+
+func TestWriteCallCounts(t *testing.T) {
+	makePayload := func(size int) []byte {
+		p := make([]byte, size)
+		for i := range p {
+			p[i] = byte(i)
+		}
+		return p
+	}
+
+	cases := []struct {
+		name   string
+		frames int
+		write  func(w *Writer, track *Track, i int) error
+		codec  codecs.Codec
+	}{
+		{
+			name:   "h264_idr_100KB",
+			frames: 1,
+			codec:  &codecs.H264{},
+			write: func(w *Writer, track *Track, i int) error {
+				idrPayload := makePayload(100_000)
+				au := [][]byte{testH264SPS, {8}, idrPayload}
+				return w.WriteH264(track, int64(i)*3600, int64(i)*3600, au)
+			},
+		},
+		{
+			name:   "h264_non_idr_20KB",
+			frames: 10,
+			codec:  &codecs.H264{},
+			write: func(w *Writer, track *Track, i int) error {
+				payload := makePayload(20_000)
+				au := [][]byte{payload}
+				return w.WriteH264(track, int64(i+1)*3600+3600, int64(i+1)*3600, au)
+			},
+		},
+		{
+			name:   "opus_50B",
+			frames: 10,
+			codec: &codecs.Opus{
+				Desc:         &substructs.OpusAudioDescriptor{ChannelConfigCode: 2},
+				ChannelCount: 2,
+			},
+			write: func(w *Writer, track *Track, i int) error {
+				packets := [][]byte{makePayload(50)}
+				return w.WriteOpus(track, int64(i)*960, packets)
+			},
+		},
+		{
+			name:   "mpeg4_audio_200B",
+			frames: 10,
+			codec: &codecs.MPEG4Audio{
+				Config: mpeg4audio.AudioSpecificConfig{
+					Type: 2, SampleRate: 48000, ChannelConfig: 2, ChannelCount: 2,
+				},
+			},
+			write: func(w *Writer, track *Track, i int) error {
+				aus := [][]byte{makePayload(200)}
+				return w.WriteMPEG4Audio(track, int64(i)*1920, aus)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := &writeCounter{}
+			track := &Track{PID: 256, Codec: tc.codec}
+			w := NewWriter(wc, []*Track{track})
+
+			// warm up: write an IDR first if testing non-IDR
+			if tc.name == "h264_non_idr_20KB" {
+				au := [][]byte{testH264SPS, {8}, {5}}
+				_ = w.WriteH264(track, 0, 0, au)
+			}
+
+			totalCalls := 0
+			totalBytes := 0
+			for i := range tc.frames {
+				wc.reset()
+				err := tc.write(w, track, i)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fmt.Printf("  frame %d: %d Write() calls, %d bytes\n", i, wc.calls, wc.bytes)
+				totalCalls += wc.calls
+				totalBytes += wc.bytes
+			}
+			avgCalls := float64(totalCalls) / float64(tc.frames)
+			avgBytes := float64(totalBytes) / float64(tc.frames)
+			fmt.Printf("  AVERAGE: %.1f Write() calls, %.0f bytes per frame\n\n", avgCalls, avgBytes)
+
+			// now test with bufio.Writer
+			wc.reset()
+			bw := bufio.NewWriterSize(wc, 7*188)
+			track2 := &Track{PID: 256, Codec: tc.codec}
+			w2 := NewWriter(bw, []*Track{track2})
+
+			if tc.name == "h264_non_idr_20KB" {
+				au := [][]byte{testH264SPS, {8}, {5}}
+				_ = w2.WriteH264(track2, 0, 0, au)
+			}
+
+			totalCallsBuf := 0
+			totalBytesBuf := 0
+			for i := range tc.frames {
+				wc.reset()
+				err := tc.write(w2, track2, i)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = bw.Flush()
+				fmt.Printf("  frame %d (buffered): %d Write() calls, %d bytes\n", i, wc.calls, wc.bytes)
+				totalCallsBuf += wc.calls
+				totalBytesBuf += wc.bytes
+			}
+			avgCallsBuf := float64(totalCallsBuf) / float64(tc.frames)
+			fmt.Printf("  AVERAGE (buffered): %.1f Write() calls per frame\n", avgCallsBuf)
+			fmt.Printf("  REDUCTION: %.1fx fewer Write() calls\n\n", avgCalls/avgCallsBuf)
+		})
+	}
 }
