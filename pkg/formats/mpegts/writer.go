@@ -1,6 +1,7 @@
 package mpegts
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -56,6 +57,7 @@ type Writer struct {
 	Tracks []*Track
 
 	nextPID            uint16
+	bw                 *bufio.Writer
 	mux                *astits.Muxer
 	pcrCounter         int
 	leadingTrackChosen bool
@@ -65,9 +67,13 @@ type Writer struct {
 func (w *Writer) Initialize() error {
 	w.nextPID = 256
 
+	// 7 TS packets per flush aligns with the standard MPEG-TS over IP
+	// packet size (RFC 2250) and SRT's typical payload boundary.
+	w.bw = bufio.NewWriterSize(w.W, 7*188)
+
 	w.mux = astits.NewMuxer(
 		context.Background(),
-		w.W)
+		w.bw)
 
 	for _, track := range w.Tracks {
 		if track.PID == 0 {
@@ -102,7 +108,11 @@ func (w *Writer) WriteTables() (int, error) {
 	if !w.leadingTrackChosen && len(w.Tracks) > 0 {
 		w.mux.SetPCRPID(w.Tracks[0].PID)
 	}
-	return w.mux.WriteTables()
+	n, err := w.mux.WriteTables()
+	if err != nil {
+		return n, err
+	}
+	return n, w.bw.Flush()
 }
 
 // NewWriter allocates a Writer.
@@ -394,7 +404,10 @@ func (w *Writer) writeVideo(
 			Data: data,
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return w.bw.Flush()
 }
 
 func (w *Writer) writeAudio(track *Track, pts int64, data []byte) error {
@@ -432,7 +445,10 @@ func (w *Writer) writeAudio(track *Track, pts int64, data []byte) error {
 			Data: data,
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return w.bw.Flush()
 }
 
 func (w *Writer) writeData(track *Track, hasPTS bool, pts int64, streamID uint8, data []byte) error {
@@ -477,5 +493,8 @@ func (w *Writer) writeData(track *Track, hasPTS bool, pts int64, streamID uint8,
 			Data:   data,
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return w.bw.Flush()
 }
