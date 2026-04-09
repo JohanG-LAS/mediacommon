@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/asticode/go-astits"
-
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/ac3"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/eac3"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
@@ -52,19 +50,6 @@ type ReaderOnDataKLVFunc func(pts int64, data []byte) error
 
 // ReaderOnDataDVBSubtitleFunc is the prototype of the callback passed to OnDataDVBSubtitle.
 type ReaderOnDataDVBSubtitleFunc func(pts int64, data []byte) error
-
-func findPMT(dem *robustDemuxer) (*astits.PMTData, error) {
-	for {
-		data, err := dem.nextData()
-		if err != nil {
-			return nil, err
-		}
-
-		if data.PMT != nil {
-			return data.PMT, nil
-		}
-	}
-}
 
 func readMetadataAUWrapper(in []byte) ([]byte, error) {
 	expectedSeqNum := 0
@@ -180,8 +165,7 @@ type Reader struct {
 
 	tracks        []*Track
 	tracksByPID   map[uint16]*Track
-	preDem        *preDemuxer
-	dem           *robustDemuxer
+	dem           *demuxer
 	onDecodeError ReaderOnDecodeErrorFunc
 	onData        map[uint16]func(int64, int64, []byte) error
 }
@@ -190,25 +174,30 @@ type Reader struct {
 func (r *Reader) Initialize() error {
 	rr := &rewindablereader.Reader{R: r.R}
 
-	preDem := &preDemuxer{R: rr}
-	preDem.initialize()
-	dem := &robustDemuxer{R: preDem}
+	dem := &demuxer{r: rr}
 	dem.initialize()
 
-	pmt, err := findPMT(dem)
-	if err != nil {
-		return err
-	}
-
-	tracks := make([]*Track, len(pmt.ElementaryStreams))
-
-	for i, es := range pmt.ElementaryStreams {
-		var track Track
-		err = track.unmarshal(dem, es)
+	// First pass: find PMT
+	var pmt *pmtData
+	for {
+		data, err := dem.nextData()
 		if err != nil {
 			return err
 		}
+		if data.hasPMT {
+			pmt = data.pmt
+			break
+		}
+	}
 
+	tracks := make([]*Track, len(pmt.elementaryStreams))
+
+	for i, es := range pmt.elementaryStreams {
+		var track Track
+		err := track.unmarshalFromES(dem, es)
+		if err != nil {
+			return err
+		}
 		tracks[i] = &track
 	}
 
@@ -219,11 +208,9 @@ func (r *Reader) Initialize() error {
 		r.tracksByPID[track.PID] = track
 	}
 
-	// rewind demuxer
+	// Rewind and create fresh demuxer for reading
 	rr.Rewind()
-	r.preDem = &preDemuxer{R: rr}
-	r.preDem.initialize()
-	r.dem = &robustDemuxer{R: r.preDem}
+	r.dem = &demuxer{r: rr}
 	r.dem.initialize()
 
 	r.onDecodeError = func(_ error) {}
@@ -251,8 +238,7 @@ func (r *Reader) Tracks() []*Track {
 // OnDecodeError sets a callback that is called when a non-fatal decode error occurs.
 func (r *Reader) OnDecodeError(cb ReaderOnDecodeErrorFunc) {
 	r.onDecodeError = cb
-	r.preDem.OnDecodeError = cb
-	r.dem.OnDecodeError = cb
+	r.dem.onDecodeError = cb
 }
 
 // OnDataH265 sets a callback that is called when data from an H265 track is received.
@@ -307,7 +293,7 @@ func (r *Reader) OnDataOpus(track *Track, cb ReaderOnDataOpusFunc) {
 		}
 
 		pos := 0
-		var packets [][]byte
+		packets := make([][]byte, 0, 4)
 
 		for {
 			var au substructs.OpusAccessUnit
@@ -380,7 +366,7 @@ func (r *Reader) OnDataMPEG1Audio(track *Track, cb ReaderOnDataMPEG1AudioFunc) {
 			return nil
 		}
 
-		var frames [][]byte
+		frames := make([][]byte, 0, 4)
 
 		for len(data) > 0 {
 			var h mpeg1audio.FrameHeader
@@ -441,19 +427,12 @@ func (r *Reader) OnDataEAC3(track *Track, cb ReaderOnDataEAC3Func) {
 			return nil
 		}
 
-		// Validate E-AC3 sync header
 		var syncInfo eac3.SyncInfo
 		err := syncInfo.Unmarshal(data)
 		if err != nil {
 			r.onDecodeError(err)
 			return nil
 		}
-
-		// E-AC3 allows multiple substreams concatenated together (independent + dependent).
-		// The frmsiz in the header only covers the first substream.
-		// Rather than parsing all substreams, we just validate the sync header and
-		// pass the full data. The downstream decoder will handle substream parsing.
-		// This matches how other decoders (FFmpeg) handle E-AC3 PES packets.
 
 		return cb(pts, data)
 	}
@@ -494,13 +473,13 @@ func (r *Reader) Read() error {
 		return err
 	}
 
-	if data.PES == nil {
+	if !data.hasPES {
 		return nil
 	}
 
-	track, ok := r.tracksByPID[data.PID]
+	track, ok := r.tracksByPID[data.pid]
 	if !ok {
-		r.onDecodeError(fmt.Errorf("received data from undeclared track with PID %d", data.PID))
+		r.onDecodeError(fmt.Errorf("received data from undeclared track with PID %d", data.pid))
 		return nil
 	}
 
@@ -508,32 +487,29 @@ func (r *Reader) Read() error {
 	var dts int64
 
 	if klvCodec, ok2 := track.Codec.(*codecs.KLV); ok2 && !klvCodec.Synchronous {
-		if data.lastPTS == nil {
+		if !data.hasLastPTS {
 			return nil
 		}
-
-		pts = *data.lastPTS
+		pts = data.lastPTS
 	} else {
-		if data.PES.Header.OptionalHeader == nil ||
-			data.PES.Header.OptionalHeader.PTSDTSIndicator == astits.PTSDTSIndicatorNoPTSOrDTS ||
-			data.PES.Header.OptionalHeader.PTSDTSIndicator == astits.PTSDTSIndicatorIsForbidden {
+		if !data.hasPTS {
 			r.onDecodeError(fmt.Errorf("PTS is missing"))
 			return nil
 		}
 
-		pts = data.PES.Header.OptionalHeader.PTS.Base
+		pts = data.pts
 
-		if data.PES.Header.OptionalHeader.PTSDTSIndicator == astits.PTSDTSIndicatorBothPresent {
-			dts = data.PES.Header.OptionalHeader.DTS.Base
+		if data.hasDTS {
+			dts = data.dts
 		} else {
 			dts = pts
 		}
 	}
 
-	onData, ok := r.onData[data.PID]
+	onData, ok := r.onData[data.pid]
 	if !ok {
 		return nil
 	}
 
-	return onData(pts, dts, data.PES.Data)
+	return onData(pts, dts, data.pesData)
 }

@@ -699,14 +699,22 @@ func TestTrackUnmarshalExternal(t *testing.T) {
 		},
 	} {
 		t.Run(ca.name, func(t *testing.T) {
-			dem := &robustDemuxer{R: bytes.NewReader(ca.byts)}
+			dem := &demuxer{r: bytes.NewReader(ca.byts)}
 			dem.initialize()
 
-			pmt, err := findPMT(dem)
-			require.NoError(t, err)
+			// Find PMT
+			var pmt *pmtData
+			for {
+				data, err := dem.nextData()
+				require.NoError(t, err)
+				if data.hasPMT {
+					pmt = data.pmt
+					break
+				}
+			}
 
 			var track Track
-			err = track.unmarshal(dem, pmt.ElementaryStreams[0])
+			err := track.unmarshalFromES(dem, pmt.elementaryStreams[0])
 			require.NoError(t, err)
 			require.Equal(t, ca.track, &track)
 		})

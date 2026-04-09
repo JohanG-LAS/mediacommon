@@ -24,19 +24,19 @@ const (
 	metadataApplicationFormatStillImageOnDemand = 0x0103
 )
 
-func findMPEG4AudioConfig(dem *robustDemuxer, pid uint16) (*mpeg4audio.AudioSpecificConfig, error) {
+func findMPEG4AudioConfigDemux(dem *demuxer, pid uint16) (*mpeg4audio.AudioSpecificConfig, error) {
 	for {
 		data, err := dem.nextData()
 		if err != nil {
 			return nil, err
 		}
 
-		if data.PES == nil || data.PID != pid {
+		if !data.hasPES || data.pid != pid {
 			continue
 		}
 
 		var adtsPkts mpeg4audio.ADTSPackets
-		err = adtsPkts.Unmarshal(data.PES.Data)
+		err = adtsPkts.Unmarshal(data.pesData)
 		if err != nil {
 			return nil, fmt.Errorf("unable to decode ADTS: %w", err)
 		}
@@ -51,25 +51,25 @@ func findMPEG4AudioConfig(dem *robustDemuxer, pid uint16) (*mpeg4audio.AudioSpec
 	}
 }
 
-func findAC3Parameters(dem *robustDemuxer, pid uint16) (int, int, error) {
+func findAC3ParametersDemux(dem *demuxer, pid uint16) (int, int, error) {
 	for {
 		data, err := dem.nextData()
 		if err != nil {
 			return 0, 0, err
 		}
 
-		if data.PES == nil || data.PID != pid {
+		if !data.hasPES || data.pid != pid {
 			continue
 		}
 
 		var syncInfo ac3.SyncInfo
-		err = syncInfo.Unmarshal(data.PES.Data)
+		err = syncInfo.Unmarshal(data.pesData)
 		if err != nil {
 			return 0, 0, fmt.Errorf("invalid AC-3 frame: %w", err)
 		}
 
 		var bsi ac3.BSI
-		err = bsi.Unmarshal(data.PES.Data[5:])
+		err = bsi.Unmarshal(data.pesData[5:])
 		if err != nil {
 			return 0, 0, fmt.Errorf("invalid AC-3 frame: %w", err)
 		}
@@ -78,19 +78,19 @@ func findAC3Parameters(dem *robustDemuxer, pid uint16) (int, int, error) {
 	}
 }
 
-func findEAC3Parameters(dem *robustDemuxer, pid uint16) (int, int, error) {
+func findEAC3ParametersDemux(dem *demuxer, pid uint16) (int, int, error) {
 	for {
 		data, err := dem.nextData()
 		if err != nil {
 			return 0, 0, err
 		}
 
-		if data.PES == nil || data.PID != pid {
+		if !data.hasPES || data.pid != pid {
 			continue
 		}
 
 		var syncInfo eac3.SyncInfo
-		err = syncInfo.Unmarshal(data.PES.Data)
+		err = syncInfo.Unmarshal(data.pesData)
 		if err != nil {
 			return 0, 0, fmt.Errorf("invalid E-AC-3 frame: %w", err)
 		}
@@ -99,94 +99,26 @@ func findEAC3Parameters(dem *robustDemuxer, pid uint16) (int, int, error) {
 	}
 }
 
-func findRegistrationIdentifier(descriptors []*astits.Descriptor) (uint32, bool) {
-	ret := uint32(0)
-
-	for _, sd := range descriptors {
-		if sd.Registration != nil {
-			// in case of multiple registrations, do not return anything
-			if ret != 0 {
-				return 0, false
-			}
-			ret = sd.Registration.FormatIdentifier
-		}
-	}
-
-	if ret == 0 {
-		return 0, false
-	}
-
-	return ret, true
-}
-
-func findKLVMetadataDescriptor(descriptors []*astits.Descriptor) *substructs.MetadataDescriptor {
-	var ret *substructs.MetadataDescriptor
-	for _, sd := range descriptors {
-		if sd.Unknown != nil {
-			if sd.Unknown.Tag == substructs.DescriptorTagMetadata {
-				var dm substructs.MetadataDescriptor
-				err := dm.Unmarshal(sd.Unknown.Content)
-				if err != nil {
-					continue
-				}
-
-				if dm.MetadataFormatIdentifier == klvaIdentifier {
-					// in case of multiple metadata, do not return anything
-					if ret != nil {
-						return nil
-					}
-					ret = &dm
-				}
-			}
-		}
-	}
-	return ret
-}
-
-func findDVBSubtitlingDescriptor(descriptors []*astits.Descriptor) []*astits.DescriptorSubtitlingItem {
-	for _, sd := range descriptors {
-		if sd.Tag == astits.DescriptorTagSubtitling && sd.Subtitling != nil {
-			return sd.Subtitling.Items
-		}
-	}
-	return nil
-}
-
-func findOpusAudioDescriptor(descriptors []*astits.Descriptor) (*substructs.OpusAudioDescriptor, error) {
-	for _, sd := range descriptors {
-		if sd.Extension != nil && sd.Extension.Tag == 0x80 && sd.Extension.Unknown != nil {
-			var oad substructs.OpusAudioDescriptor
-			err := oad.Unmarshal(*sd.Extension.Unknown)
-			if err != nil {
-				return nil, err
-			}
-
-			return &oad, nil
-		}
-	}
-	return nil, fmt.Errorf("opus audio descriptor not found")
-}
-
-func findCodec(dem *robustDemuxer, es *astits.PMTElementaryStream) (codecs.Codec, error) {
-	switch es.StreamType {
+func findCodecFromES(dem *demuxer, es pmtElementaryStream) (codecs.Codec, error) {
+	switch es.streamType {
 	// video
 
-	case astits.StreamTypeH265Video:
+	case streamTypeH265Video:
 		return &codecs.H265{}, nil
 
-	case astits.StreamTypeH264Video:
+	case streamTypeH264Video:
 		return &codecs.H264{}, nil
 
-	case astits.StreamTypeMPEG4Video:
+	case streamTypeMPEG4Video:
 		return &codecs.MPEG4Video{}, nil
 
-	case astits.StreamTypeMPEG2Video, astits.StreamTypeMPEG1Video:
+	case streamTypeMPEG2Video, streamTypeMPEG1Video:
 		return &codecs.MPEG1Video{}, nil
 
-		// audio
+	// audio
 
-	case astits.StreamTypeAACAudio:
-		conf, err := findMPEG4AudioConfig(dem, es.ElementaryPID)
+	case streamTypeAACAudio:
+		conf, err := findMPEG4AudioConfigDemux(dem, es.pid)
 		if err != nil {
 			return nil, err
 		}
@@ -195,14 +127,14 @@ func findCodec(dem *robustDemuxer, es *astits.PMTElementaryStream) (codecs.Codec
 			Config: *conf,
 		}, nil
 
-	case astits.StreamTypeAACLATMAudio:
+	case streamTypeAACLATMAudio:
 		return &codecs.MPEG4AudioLATM{}, nil
 
-	case astits.StreamTypeMPEG1Audio:
+	case streamTypeMPEG1Audio:
 		return &codecs.MPEG1Audio{}, nil
 
-	case astits.StreamTypeAC3Audio:
-		sampleRate, channelCount, err := findAC3Parameters(dem, es.ElementaryPID)
+	case streamTypeAC3Audio:
+		sampleRate, channelCount, err := findAC3ParametersDemux(dem, es.pid)
 		if err != nil {
 			return nil, err
 		}
@@ -212,8 +144,8 @@ func findCodec(dem *robustDemuxer, es *astits.PMTElementaryStream) (codecs.Codec
 			ChannelCount: channelCount,
 		}, nil
 
-	case astits.StreamTypeEAC3Audio:
-		sampleRate, channelCount, err := findEAC3Parameters(dem, es.ElementaryPID)
+	case streamTypeEAC3Audio:
+		sampleRate, channelCount, err := findEAC3ParametersDemux(dem, es.pid)
 		if err != nil {
 			return nil, err
 		}
@@ -223,20 +155,26 @@ func findCodec(dem *robustDemuxer, es *astits.PMTElementaryStream) (codecs.Codec
 			ChannelCount: channelCount,
 		}, nil
 
-		// other
+	// other
 
-	case astits.StreamTypePrivateData:
-		if id, ok := findRegistrationIdentifier(es.ElementaryStreamDescriptors); ok {
+	case streamTypePrivateData:
+		if id, ok := findRegistrationID(es.descriptors); ok {
 			switch id {
 			case opusIdentifier:
-				desc, err := findOpusAudioDescriptor(es.ElementaryStreamDescriptors)
+				data, found := findExtensionDescriptorData(es.descriptors, 0x80)
+				if !found {
+					return nil, fmt.Errorf("opus audio descriptor not found")
+				}
+
+				var oad substructs.OpusAudioDescriptor
+				err := oad.Unmarshal(data)
 				if err != nil {
 					return nil, fmt.Errorf("invalid Opus audio descriptor: %w", err)
 				}
 
 				return &codecs.Opus{
-					Desc:         desc,
-					ChannelCount: desc.ChannelCount(),
+					Desc:         &oad,
+					ChannelCount: oad.ChannelCount(),
 				}, nil
 
 			case klvaIdentifier:
@@ -244,18 +182,38 @@ func findCodec(dem *robustDemuxer, es *astits.PMTElementaryStream) (codecs.Codec
 					Synchronous: false,
 				}, nil
 			}
-		} else if items := findDVBSubtitlingDescriptor(es.ElementaryStreamDescriptors); items != nil {
+		} else if items := findSubtitlingItems(es.descriptors); items != nil {
+			astitsItems := make([]*astits.DescriptorSubtitlingItem, len(items))
+			for i, item := range items {
+				lang := make([]byte, len(item.Language))
+				copy(lang, item.Language)
+				astitsItems[i] = &astits.DescriptorSubtitlingItem{
+					Language:          lang,
+					Type:              item.Type,
+					CompositionPageID: item.CompositionPageID,
+					AncillaryPageID:   item.AncillaryPageID,
+				}
+			}
+
 			return &codecs.DVBSubtitle{
-				Items: items,
+				Items: astitsItems,
 			}, nil
 		}
 
-	case astits.StreamTypeMetadata:
-		desc := findKLVMetadataDescriptor(es.ElementaryStreamDescriptors)
-		if desc != nil {
-			return &codecs.KLV{
-				Synchronous: true,
-			}, nil
+	case streamTypeMetadata:
+		metaDescs := findMetadataDescriptorData(es.descriptors)
+		for _, descData := range metaDescs {
+			var dm substructs.MetadataDescriptor
+			err := dm.Unmarshal(descData)
+			if err != nil {
+				continue
+			}
+
+			if dm.MetadataFormatIdentifier == klvaIdentifier {
+				return &codecs.KLV{
+					Synchronous: true,
+				}, nil
+			}
 		}
 	}
 
@@ -296,17 +254,12 @@ func ac3ComponentType(channels int, fullService bool) uint8 {
 //	0x00-0x3F: Full service, complete main
 //	Bits 2-0 encode channel config: 0=mono/stereo, 1=mono, 2=stereo, 3=2ch, etc.
 func eac3ComponentType(channels int, fullService bool) uint8 {
-	// Start with full service, complete main audio (bits 7-4 = 0000)
 	var ct uint8
 
-	// Set full_service_flag (bit 0)
 	if fullService {
 		ct |= 0x01
 	}
 
-	// Encode channel configuration in bits 3-1 (number_of_channels)
-	// Per EN 300 468: 0=1-2ch, 1=mono, 2=2ch stereo, 3=2ch surround,
-	//                 4=multichannel mono, 5=multichannel stereo, 6=multichannel surround
 	switch {
 	case channels <= 2:
 		ct |= (0x02 << 1) // 2ch stereo
@@ -374,8 +327,6 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			StreamType:    astits.StreamTypePrivateData,
 			ElementaryStreamDescriptors: []*astits.Descriptor{
 				{
-					// Length must be different than zero.
-					// https://github.com/asticode/go-astits/blob/7c2bf6b71173d24632371faa01f28a9122db6382/descriptor.go#L2146-L2148
 					Length: 1,
 					Tag:    astits.DescriptorTagRegistration,
 					Registration: &astits.DescriptorRegistration{
@@ -383,14 +334,9 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 					},
 				},
 				{
-					// Length must be different than zero.
-					// https://github.com/asticode/go-astits/blob/7c2bf6b71173d24632371faa01f28a9122db6382/descriptor.go#L2146-L2148
 					Length: 1,
 					Tag:    astits.DescriptorTagExtension,
 					Extension: &astits.DescriptorExtension{
-						// opus_audio_descriptor per ETSI TS Opus v0.1.3-draft, Section 5.3.
-						// descriptor_tag_extension = 0x80; Unknown holds the bytes that
-						// follow it, starting with channel_config_code.
 						Tag:     0x80,
 						Unknown: &enc,
 					},
@@ -404,16 +350,13 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			StreamType:    astits.StreamTypeAC3Audio,
 			ElementaryStreamDescriptors: []*astits.Descriptor{
 				{
-					// Length must be different than zero for astits writer
-					// 1 byte flags + 1 byte component_type + 1 byte BSID = 3 bytes
 					Length: 3,
 					Tag:    astits.DescriptorTagAC3,
 					AC3: &astits.DescriptorAC3{
 						HasComponentType: true,
 						ComponentType:    ac3ComponentType(c.ChannelCount, true),
-						// BSID for standard AC-3 (not E-AC-3)
-						HasBSID: true,
-						BSID:    8,
+						HasBSID:          true,
+						BSID:             8,
 					},
 				},
 			},
@@ -425,16 +368,13 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			StreamType:    astits.StreamTypeEAC3Audio,
 			ElementaryStreamDescriptors: []*astits.Descriptor{
 				{
-					// Length must be different than zero for astits writer
-					// 1 byte flags + 1 byte component_type + 1 byte BSID = 3 bytes
 					Length: 3,
 					Tag:    astits.DescriptorTagEnhancedAC3,
 					EnhancedAC3: &astits.DescriptorEnhancedAC3{
 						HasComponentType: true,
 						ComponentType:    eac3ComponentType(c.ChannelCount, true),
-						// BSID=16 indicates E-AC-3
-						HasBSID: true,
-						BSID:    16,
+						HasBSID:          true,
+						BSID:             16,
 					},
 				},
 			},
@@ -458,7 +398,7 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			StreamType:    astits.StreamTypeMPEG1Audio,
 		}, nil
 
-		// other
+	// other
 
 	case *codecs.KLV:
 		if c.Synchronous {
@@ -488,8 +428,6 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 				StreamType:    astits.StreamTypeMetadata,
 				ElementaryStreamDescriptors: []*astits.Descriptor{
 					{
-						// Length must be different than zero.
-						// https://github.com/asticode/go-astits/blob/7c2bf6b71173d24632371faa01f28a9122db6382/descriptor.go#L2146-L2148
 						Length: 1,
 						Tag:    substructs.DescriptorTagMetadata,
 						Unknown: &astits.DescriptorUnknown{
@@ -497,8 +435,6 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 						},
 					},
 					{
-						// Length must be different than zero.
-						// https://github.com/asticode/go-astits/blob/7c2bf6b71173d24632371faa01f28a9122db6382/descriptor.go#L2146-L2148
 						Length: 1,
 						Tag:    substructs.DescriptorTagMetadataSTD,
 						Unknown: &astits.DescriptorUnknown{
@@ -514,8 +450,6 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			StreamType:    astits.StreamTypePrivateData,
 			ElementaryStreamDescriptors: []*astits.Descriptor{
 				{
-					// Length must be different than zero.
-					// https://github.com/asticode/go-astits/blob/7c2bf6b71173d24632371faa01f28a9122db6382/descriptor.go#L2146-L2148
 					Length: 1,
 					Tag:    astits.DescriptorTagRegistration,
 					Registration: &astits.DescriptorRegistration{
@@ -531,8 +465,6 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			StreamType:    astits.StreamTypePrivateData,
 			ElementaryStreamDescriptors: []*astits.Descriptor{
 				{
-					// Length must be different than zero.
-					// https://github.com/asticode/go-astits/blob/7c2bf6b71173d24632371faa01f28a9122db6382/descriptor.go#L2146-L2148
 					Length: 1,
 					Tag:    astits.DescriptorTagSubtitling,
 					Subtitling: &astits.DescriptorSubtitling{
@@ -547,10 +479,10 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 	}
 }
 
-func (t *Track) unmarshal(dem *robustDemuxer, es *astits.PMTElementaryStream) error {
-	t.PID = es.ElementaryPID
+func (t *Track) unmarshalFromES(dem *demuxer, es pmtElementaryStream) error {
+	t.PID = es.pid
 
-	codec, err := findCodec(dem, es)
+	codec, err := findCodecFromES(dem, es)
 	if err != nil {
 		return err
 	}

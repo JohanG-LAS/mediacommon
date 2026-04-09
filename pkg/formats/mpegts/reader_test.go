@@ -1885,6 +1885,153 @@ func TestReaderSkipGarbage(t *testing.T) {
 	}, aus)
 }
 
+func TestReaderPSITablesIgnored(t *testing.T) {
+	// Verify that non-PES PSI tables (SDT, NIT, etc.) and null packets
+	// injected into the stream do not cause spurious "invalid PES start code"
+	// decode errors. This reproduces the bug seen with live encoders that
+	// multiplex SDT/NIT alongside elementary streams.
+
+	var buf bytes.Buffer
+	mux := astits.NewMuxer(context.Background(), &buf)
+
+	err := mux.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: 256,
+		StreamType:    astits.StreamTypeH264Video,
+	})
+	require.NoError(t, err)
+
+	mux.SetPCRPID(256)
+
+	_, err = mux.WriteData(&astits.MuxerData{
+		PID: 256,
+		PES: &astits.PESData{
+			Header: &astits.PESHeader{
+				OptionalHeader: &astits.PESOptionalHeader{
+					MarkerBits:      2,
+					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
+					PTS:             &astits.ClockReference{Base: 90000},
+				},
+				StreamID: streamIDVideo,
+			},
+			Data: []byte{0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 5, 1, 2, 3},
+		},
+	})
+	require.NoError(t, err)
+
+	stream := buf.Bytes()
+	var out bytes.Buffer
+	out.Write(stream)
+
+	// Build raw SDT packet (PID 0x0011, PUSI=1, table_id=0x42)
+	var sdtPkt [188]byte
+	sdtPkt[0] = 0x47
+	sdtPkt[1] = 0x40 | byte(0x0011>>8)
+	sdtPkt[2] = byte(0x0011)
+	sdtPkt[3] = 0x10
+	sdtPkt[4] = 0x00 // pointer_field
+	sdtPkt[5] = 0x42 // table_id (SDT actual)
+	sdtPkt[6] = 0xF0
+	sdtPkt[7] = 0x09 // section_length = 9
+	for i := 8; i < 188; i++ {
+		sdtPkt[i] = 0xFF
+	}
+
+	// Build raw NIT packet (PID 0x0010, PUSI=1, table_id=0x40)
+	var nitPkt [188]byte
+	nitPkt[0] = 0x47
+	nitPkt[1] = 0x40 | byte(0x0010>>8)
+	nitPkt[2] = byte(0x0010)
+	nitPkt[3] = 0x10
+	nitPkt[4] = 0x00 // pointer_field
+	nitPkt[5] = 0x40 // table_id (NIT actual)
+	nitPkt[6] = 0xF0
+	nitPkt[7] = 0x09
+	for i := 8; i < 188; i++ {
+		nitPkt[i] = 0xFF
+	}
+
+	// Build null packet (PID 0x1FFF)
+	var nullPkt [188]byte
+	nullPkt[0] = 0x47
+	nullPkt[1] = 0x1F
+	nullPkt[2] = 0xFF
+	nullPkt[3] = 0x10
+	for i := 4; i < 188; i++ {
+		nullPkt[i] = 0xFF
+	}
+
+	// Inject PSI and null packets twice each (the bug triggered on the
+	// second occurrence when the demuxer tried to flush accumulated data)
+	for range 2 {
+		out.Write(sdtPkt[:])
+		out.Write(nitPkt[:])
+		out.Write(nullPkt[:])
+	}
+
+	// Write a second PES to trigger the flush of the first
+	buf.Reset()
+	mux2 := astits.NewMuxer(context.Background(), &buf)
+	err = mux2.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: 256,
+		StreamType:    astits.StreamTypeH264Video,
+	})
+	require.NoError(t, err)
+	mux2.SetPCRPID(256)
+
+	_, err = mux2.WriteData(&astits.MuxerData{
+		PID: 256,
+		PES: &astits.PESData{
+			Header: &astits.PESHeader{
+				OptionalHeader: &astits.PESOptionalHeader{
+					MarkerBits:      2,
+					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
+					PTS:             &astits.ClockReference{Base: 180000},
+				},
+				StreamID: streamIDVideo,
+			},
+			Data: []byte{0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 1, 5, 6, 7},
+		},
+	})
+	require.NoError(t, err)
+
+	// Append second PES packets (skip PAT/PMT which are the first 2 × 188 bytes)
+	stream2 := buf.Bytes()
+	if len(stream2) > 2*188 {
+		out.Write(stream2[2*188:])
+	}
+
+	r, err := NewReader(bytes.NewReader(out.Bytes()))
+	require.NoError(t, err)
+
+	var decErrs []string
+	r.OnDecodeError(func(err error) {
+		decErrs = append(decErrs, err.Error())
+	})
+
+	var receivedPTS []int64
+	r.OnDataH264(r.Tracks()[0], func(pts int64, _ int64, _ [][]byte) error {
+		receivedPTS = append(receivedPTS, pts)
+		return nil
+	})
+
+	for {
+		err = r.Read()
+		if err != nil {
+			require.ErrorIs(t, io.EOF, err)
+			break
+		}
+	}
+
+	// No decode errors should have been reported — PSI tables must be
+	// silently ignored, not misinterpreted as malformed PES.
+	for _, e := range decErrs {
+		require.NotContains(t, e, "PES start code",
+			"PSI table was misinterpreted as PES data")
+	}
+
+	require.NotEmpty(t, receivedPTS, "expected to receive H264 data")
+}
+
 func FuzzReader(f *testing.F) {
 	for _, ca := range casesReadWriter {
 		var buf bytes.Buffer
